@@ -146,7 +146,15 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	resp, err := search(q, *resultSize)
+	size := *resultSize
+	if s := r.URL.Query().Get("size"); s != "" {
+		fmt.Sscanf(s, "%d", &size)
+		if size < 1 || size > 100 {
+			size = *resultSize
+		}
+	}
+
+	resp, err := search(q, size)
 	if err != nil {
 		log.Printf("search error: %v", err)
 		http.Error(w, `{"error":"search failed"}`, http.StatusInternalServerError)
@@ -171,6 +179,7 @@ func main() {
 
 	http.HandleFunc("/search", handleSearch)
 	http.HandleFunc("/health", handleHealth)
+	http.Handle("/", http.FileServer(http.Dir("static")))
 
 	log.Printf("Search API listening on %s", *listenAddr)
 	log.Printf("  ES: %s/%s", *esURL, *esIndex)
