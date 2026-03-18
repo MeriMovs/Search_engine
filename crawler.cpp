@@ -41,6 +41,34 @@ std::string utc_timestamp() {
 }
 
 // ---------------------------------------------------------------------------
+// JSON string escaping
+// ---------------------------------------------------------------------------
+std::string json_escape(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 16);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
 // Tokenization — lowercase, keep [a-z0-9] tokens only
 // ---------------------------------------------------------------------------
 std::vector<std::string> tokenize(const std::string& text) {
@@ -109,6 +137,79 @@ public:
 
 private:
     long timeout_;
+};
+
+// ---------------------------------------------------------------------------
+// ESClient  (one instance per thread — owns its own CURL handle)
+// ---------------------------------------------------------------------------
+class ESClient {
+public:
+    ESClient(std::string base_url, std::string index)
+        : base_url_(std::move(base_url))
+        , index_(std::move(index))
+        , curl_(curl_easy_init())
+    {}
+
+    ~ESClient() {
+        if (curl_) curl_easy_cleanup(curl_);
+    }
+
+    ESClient(const ESClient&)            = delete;
+    ESClient& operator=(const ESClient&) = delete;
+
+    // Returns HTTP response code, or -1 on CURL error.
+    int index_page(const PageData& pg) {
+        if (!curl_) return -1;
+
+        std::string url  = base_url_ + "/" + index_ + "/_doc";
+        std::string body = build_json(pg);
+
+        curl_easy_reset(curl_);
+
+        struct curl_slist* headers = nullptr;
+        headers = curl_slist_append(headers, "Content-Type: application/json");
+
+        curl_easy_setopt(curl_, CURLOPT_URL,           url.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDS,    body.c_str());
+        curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER,    headers);
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT,       10L);
+        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, discard_cb);
+
+        CURLcode res = curl_easy_perform(curl_);
+        curl_slist_free_all(headers);
+
+        if (res != CURLE_OK) return -1;
+
+        long code = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &code);
+        return static_cast<int>(code);
+    }
+
+private:
+    std::string base_url_;
+    std::string index_;
+    CURL*       curl_;
+
+    static size_t discard_cb(void*, size_t size, size_t nmemb, void*) {
+        return size * nmemb;
+    }
+
+    std::string build_json(const PageData& pg) const {
+        static constexpr size_t MAX_TEXT = 32 * 1024;
+        const std::string text = pg.text.size() > MAX_TEXT
+                                 ? pg.text.substr(0, MAX_TEXT)
+                                 : pg.text;
+        std::ostringstream ss;
+        ss << "{"
+           << "\"url\":\""       << json_escape(pg.url)       << "\","
+           << "\"timestamp\":\"" << json_escape(pg.timestamp) << "\","
+           << "\"status\":"      << pg.status_code            << ","
+           << "\"text\":\""      << json_escape(text)         << "\","
+           << "\"token_count\":" << pg.tokens.size()
+           << "}";
+        return ss.str();
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -231,13 +332,15 @@ static std::mutex cout_mtx;
 // ---------------------------------------------------------------------------
 // Worker thread function
 // ---------------------------------------------------------------------------
-void worker(WorkQueue& wq,
-            int        timeout_secs,
-            int        max_pages,
-            std::atomic<int>& pages_crawled)
+void worker(WorkQueue&         wq,
+            int                timeout_secs,
+            int                max_pages,
+            std::atomic<int>&  pages_crawled,
+            const std::string& es_url,
+            const std::string& es_index)
 {
-    // Each thread owns its own PageLoader (and therefore its own CURL handle).
     PageLoader loader(static_cast<long>(timeout_secs));
+    ESClient   es_client(es_url, es_index);
 
     while (true) {
         std::string url;
@@ -288,6 +391,16 @@ void worker(WorkQueue& wq,
             std::cout << "Links found: " << pg.links.size() << "\n\n";
         }
 
+        // Index in ElasticSearch
+        int es_status = es_client.index_page(pg);
+        {
+            std::lock_guard<std::mutex> lk(cout_mtx);
+            if (es_status == 200 || es_status == 201)
+                std::cout << "[ES OK]   " << pg.url << " -> " << es_status << "\n";
+            else
+                std::cout << "[ES FAIL] " << pg.url << " -> " << es_status << "\n";
+        }
+
         // Enqueue newly discovered links only if we haven't hit the limit.
         if (max_pages == 0 ||
             pages_crawled.load(std::memory_order_relaxed) < max_pages)
@@ -315,7 +428,9 @@ static void print_usage(const char* argv0) {
               << "  seed_url     First URL to crawl (required)\n"
               << "  --threads N  Number of worker threads  (default: " << DEFAULT_THREADS   << ")\n"
               << "  --timeout S  Per-request timeout (sec)  (default: " << DEFAULT_TIMEOUT   << ")\n"
-              << "  --max-pages N  Stop after N successful pages (default: unlimited)\n";
+              << "  --max-pages N  Stop after N successful pages (default: unlimited)\n"
+              << "  --es-url URL   ElasticSearch base URL     (default: http://localhost:9200)\n"
+              << "  --es-index N   ES index name              (default: pages)\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -324,9 +439,11 @@ static void print_usage(const char* argv0) {
 int main(int argc, char* argv[]) {
     // ---- Parse CLI arguments ----
     std::string seed_url;
-    int num_threads = DEFAULT_THREADS;
-    int timeout     = DEFAULT_TIMEOUT;
-    int max_pages   = DEFAULT_MAX_PAGES;
+    int         num_threads = DEFAULT_THREADS;
+    int         timeout     = DEFAULT_TIMEOUT;
+    int         max_pages   = DEFAULT_MAX_PAGES;
+    std::string es_url      = "http://localhost:9200";
+    std::string es_index    = "pages";
 
     for (int i = 1; i < argc; ++i) {
         std::string arg(argv[i]);
@@ -343,6 +460,12 @@ int main(int argc, char* argv[]) {
             if (i + 1 >= argc) { std::cerr << "Missing value for --max-pages\n"; return 1; }
             max_pages = std::stoi(argv[++i]);
             if (max_pages < 0) { std::cerr << "--max-pages must be >= 0\n"; return 1; }
+        } else if (arg == "--es-url") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --es-url\n"; return 1; }
+            es_url = argv[++i];
+        } else if (arg == "--es-index") {
+            if (i + 1 >= argc) { std::cerr << "Missing value for --es-index\n"; return 1; }
+            es_index = argv[++i];
         } else if (seed_url.empty() && arg.substr(0, 2) != "--") {
             seed_url = arg;
         } else {
@@ -361,8 +484,9 @@ int main(int argc, char* argv[]) {
               << "  seed:      " << seed_url    << "\n"
               << "  threads:   " << num_threads  << "\n"
               << "  timeout:   " << timeout      << "s\n"
-              << "  max-pages: " << (max_pages > 0 ? std::to_string(max_pages) : "unlimited")
-              << "\n\n";
+              << "  max-pages: " << (max_pages > 0 ? std::to_string(max_pages) : "unlimited") << "\n"
+              << "  es-url:    " << es_url    << "\n"
+              << "  es-index:  " << es_index  << "\n\n";
 
     // ---- Set up and run ----
     // curl_global_init is NOT thread-safe; call it once before spawning threads.
@@ -379,7 +503,9 @@ int main(int argc, char* argv[]) {
                              std::ref(wq),
                              timeout,
                              max_pages,
-                             std::ref(pages_crawled));
+                             std::ref(pages_crawled),
+                             std::cref(es_url),
+                             std::cref(es_index));
 
     for (auto& t : threads)
         t.join();
